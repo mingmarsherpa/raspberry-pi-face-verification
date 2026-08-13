@@ -1,0 +1,12 @@
+[project]
+name = "facerecognition"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi>=0.141.1",
+    "opencv-python-headless>=5.0.0.93",
+    "uvicorn>=0.52.1",
+    "websockets>=17.0.1",
+]

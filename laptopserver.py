@@ -6,7 +6,7 @@ import random
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Set
+from typing import Any, Optional, Set
 
 import cv2
 import numpy as np
@@ -20,6 +20,8 @@ log = logging.getLogger("video")
 
 CAPTURES_DIR = "captures"
 KNOWN_FACES_DIR = "known_faces"
+SUSPICIOUS_DIR = "suspicious"
+
 AI_SAMPLE_INTERVAL_SECONDS = 0.2
 CLEAR_ACTIVE_AFTER_NO_FACE_CHECKS = 3
 FPS_LOG_WINDOW_SECONDS = 5.0
@@ -32,6 +34,7 @@ LIVENESS_PITCH_DELTA_THRESHOLD = 0.12
 
 os.makedirs(CAPTURES_DIR, exist_ok=True)
 os.makedirs(KNOWN_FACES_DIR, exist_ok=True)
+os.makedirs(SUSPICIOUS_DIR, exist_ok=True)
 
 @dataclass(frozen=True)
 class HeadPoseMeasurement:
@@ -186,74 +189,86 @@ def _process_sampled_frame(
     frame_bytes: bytes,
     detector: YunetDetector,
     recognizer: SFaceRecognizer,
+    spoof_detector: Any,  # NEW
+    mask_detector: Any,   # NEW
     run_recognition: bool,
     saved_faces_cache: dict,
-) -> tuple[bytes, bool, Optional[str], Optional[float], Optional[np.ndarray]]:
+) -> tuple[bytes, bool, str, Optional[str], Optional[float], Optional[np.ndarray]]:
+    
     img = cv2.imdecode(np.frombuffer(frame_bytes, np.uint8), cv2.IMREAD_COLOR)
     if img is None:
-        return frame_bytes, False, None, None, None
+        return frame_bytes, False, "none", None, None, None
 
     raw_faces = detector.detect_raw(img)
     if len(raw_faces) == 0:
-        return frame_bytes, False, None, None, None
+        return frame_bytes, False, "none", None, None, None
 
     img_h, img_w, _ = img.shape
-    for face in raw_faces:
-        x, y, w, h = map(int, face[:4])
-        x1, y1 = max(0, x), max(0, y)
-        x2, y2 = min(img_w, x + w), min(img_h, y + h)
-        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    primary_face = raw_faces[0]
+    x, y, w, h = map(int, primary_face[:4])
+    bbox = (x, y, w, h)
+    
+    # 1. Mask Check
+    if mask_detector.is_masked(img, bbox):
+        cv2.rectangle(img, (x, y), (x+w, y+h), (0, 0, 255), 3)
+        cv2.putText(img, "FACE COVERED! REMOVE MASK", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        success, encoded = cv2.imencode(".jpg", img)
+        return encoded.tobytes() if success else frame_bytes, True, "masked", None, None, primary_face
 
-    recognized_name: Optional[str] = None
-    recognized_score: Optional[float] = None
+    # 2. Anti-Spoof Check
+    is_real, spoof_score = spoof_detector.is_real(img, bbox)
+    if not is_real:
+        cv2.rectangle(img, (x, y), (x+w, y+h), (0, 165, 255), 3)
+        cv2.putText(img, "SPOOF DETECTED!", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
+        success, encoded = cv2.imencode(".jpg", img)
+        return encoded.tobytes() if success else frame_bytes, True, "spoof", None, None, primary_face
 
+    # 3. Standard Recognition (Only if clear)
+    recognized_name, recognized_score = None, None
     if run_recognition:
-        primary_face = raw_faces[0]
         recognized_name, recognized_score = recognizer.recognize(img, primary_face)
-        x, y, w, h = map(int, primary_face[:4])
-        x1, y1 = max(0, x), max(0, y)
-        x2, y2 = min(img_w, x + w), min(img_h, y + h)
+        label = f"{recognized_name} ({recognized_score:.2f})"
+        cv2.rectangle(img, (x, y), (x+w, y+h), (0, 255, 0), 2)
+        cv2.putText(img, label, (x, max(20, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-        score_str = f"{recognized_score:.2f}" if recognized_score is not None else "N/A"
-        label = f"{recognized_name} ({score_str})"
-        cv2.putText(
-            img,
-            label,
-            (x1, max(20, y1 - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 0),
-            2,
-        )
-
+        # Cache saving logic for known faces
         now_ts = time.time()
-        if x2 > x1 and y2 > y1 and (now_ts - saved_faces_cache.get(recognized_name, 0.0) > 10.0):
+        if now_ts - saved_faces_cache.get(recognized_name, 0.0) > 10.0 and recognized_name != "unknown":
             saved_faces_cache[recognized_name] = now_ts
+            x1, y1 = max(0, x), max(0, y)
+            x2, y2 = min(img_w, x + w), min(img_h, y + h)
             cropped = img[y1:y2, x1:x2]
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            saved_path = os.path.join(CAPTURES_DIR, f"{recognized_name}_{timestamp}.jpg")
-            cv2.imwrite(saved_path, cropped)
+            if cropped.size > 0:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                saved_path = os.path.join(CAPTURES_DIR, f"{recognized_name}_{timestamp}.jpg")
+                cv2.imwrite(saved_path, cropped)
 
     success, encoded = cv2.imencode(".jpg", img)
-    if success:
-        return encoded.tobytes(), True, recognized_name, recognized_score, raw_faces[0]
-    return frame_bytes, True, recognized_name, recognized_score, raw_faces[0]
+    return encoded.tobytes() if success else frame_bytes, True, "clear", recognized_name, recognized_score, primary_face
 
 
 async def ai_worker():
     log.info("AI Worker starting...")
     queue = raw_broadcaster.subscribe()
+    #importing here to avoid circular import issues
+    from src.detect.antispoof import AntiSpoofDetector
+    from src.detect.mask import MaskDetector
 
     detector: Optional[YunetDetector] = None
     recognizer: Optional[SFaceRecognizer] = None
+    spoof_detector: Optional[AntiSpoofDetector] = None
+    mask_detector: Optional[MaskDetector] = None
     try:
         detector = YunetDetector(conf_threshold=0.45)
         recognizer = SFaceRecognizer(known_faces_dir=KNOWN_FACES_DIR, detector=detector)
-        log.info("AI models loaded (YuNet + SFace)")
+        spoof_detector = AntiSpoofDetector()
+        mask_detector = MaskDetector()
+        log.info("AI models loaded (YuNet + SFace + AntiSpoof + Mask)")
     except Exception:
         log.exception("AI model init failed. Serving passthrough video only.")
 
     saved_faces_cache = {}
+    suspicious_cache = 0.0
     face_active = False
     no_face_checks = 0
     confirmed_name: Optional[str] = None
@@ -278,11 +293,13 @@ async def ai_worker():
 
             sample_start = time.monotonic()
 
-            annotated_bytes, has_face, recognized_name, recognized_score, primary_face = await asyncio.to_thread(
+            annotated_bytes, has_face, status, recognized_name, recognized_score, primary_face = await asyncio.to_thread(
                 _process_sampled_frame,
                 frame_bytes,
                 detector,
                 recognizer,
+                spoof_detector,
+                mask_detector,
                 liveness.current_challenge is None,
                 saved_faces_cache,
             )
@@ -300,6 +317,22 @@ async def ai_worker():
                 if not face_active:
                     face_active = True
                     log.info("Face detected")
+                if status in ["masked", "spoof"]:
+                    liveness.reset(log_reset=False)
+                    confirmed_name = None
+                    recognition_samples = 0
+                    
+                    now_ts = time.time()
+                    # Throttle saving suspicious images to once every 5 seconds
+                    if now_ts - suspicious_cache > 5.0:
+                        suspicious_cache = now_ts
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        filepath = os.path.join(SUSPICIOUS_DIR, f"{status}_{timestamp}.jpg")
+                        with open(filepath, "wb") as f:
+                            f.write(frame_bytes) # Save original unannotated frame
+                        log.warning(f"Suspicious activity ({status}) recorded at {filepath}")
+                    continue
+
                 if liveness.current_challenge is None:
                     if recognized_name is not None and recognized_name != "unknown":
                         if recognized_name == confirmed_name:
